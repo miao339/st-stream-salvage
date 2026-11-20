@@ -136,7 +136,7 @@
     function setEnabled(value) {
         state.enabled = Boolean(value);
         try { localStorage.setItem(PREF_KEY, state.enabled ? '1' : '0'); } catch (_) {}
-        notify(state.enabled ? '空回自动抢救：已开启' : '空回自动抢救：已关闭');
+        notify(state.enabled ? '空回捕获：已开启' : '空回捕获：已关闭');
     }
 
     function log(...args) {
@@ -584,7 +584,7 @@
 
             <label style="display:flex;align-items:center;gap:8px;padding:9px 0;border-top:1px solid var(--SmartThemeBorderColor);cursor:pointer;">
                 <input type="checkbox" id="ss-assistant-enable" ${state.enabled ? 'checked' : ''} style="margin:0;">
-                <span>启用自动抢救</span>
+                <span>启用空回捕获</span>
             </label>
 
             <div style="padding:8px 0;border-top:1px solid var(--SmartThemeBorderColor);font-size:.9em;opacity:.85;line-height:1.7;">
