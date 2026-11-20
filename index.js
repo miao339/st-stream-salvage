@@ -1,38 +1,37 @@
 /**
  * 流式抢救 · Stream Salvage
  * ------------------------------------------------------------------
- * 解决什么问题：
- *   某些中转站在生成结束时，会把整段结果塞进一个超长的 SSE 事件里一次性推过来。
- *   如果这一下没推完整（断在字符串中间、或者整条事件没有换行收尾），
- *   酒馆的流解析器就凑不出一个完整事件，JSON.parse 失败，界面一片空白。
+ * 解决的问题：
+ *   部分中转站是「假流式」——先在服务器上把整段写完，最后一次性推回来。
+ *   这一下没推完整时，酒馆的流解析器凑不出完整事件，界面一片空白（空回）。
  *
- * 本插件做什么：
- *   在 window.fetch 层接管 SSE 响应，按行缓冲。
- *   完整的行立刻原样转发（不影响正常流式体验），
- *   不完整的尾巴留在本地。等流结束时，从残缺尾巴里把已经闭合的字段捞出来，
- *   重新封成一个合法的 tool_calls 事件 + finish_reason + [DONE] 再交给下游。
+ * 这个插件做两件事：
+ *   1. 自动兜底：断在行内时，把已经写完整的字段捞出来，重封成合法事件。
+ *   2. 手动抢救：缓存最近一次响应，「空回抢救」按钮可随时把正文救进聊天。
  *
- * 对正常响应做什么：
- *   什么都不做。字节原样透传，不解析、不改写、不加延迟。
- *
- * 优先级：
- *   每 800ms 检查一次 window.fetch。如果被别的插件重新包装过，
- *   就再包一层，保证我们永远在最外层，能拿到最原始的字节流。
+ * 对正常响应：字节原样透传，不解析、不改写、不加延迟。
  */
 
 (function () {
     'use strict';
 
     const SCRIPT_NAME = '流式抢救 · Stream Salvage';
-    const VERSION = '1.0.0';
+    const VERSION = '1.1.0';
     const WRAP_MARK = '__streamSalvageOuter__';
     const GUARD_MS = 800;
+    const MAX_WRAP_DEPTH = 3;
+    const CAPTURE_LIMIT = 8 * 1024 * 1024;
+    // 只接管聊天补全端点。别的请求（模型列表、存档、图片、世界书）一个字都不碰，
+    // 原样调用 inner.fetch，不解析也不拷贝，避免和任何其他插件抢活。
+    const CHAT_ENDPOINT = /\/(?:api\/backends\/chat-completions\/generate|api\/backends\/text-completions\/generate|v1\/chat\/completions|chat\/completions|generateContent)(?:[?#]|$)/i;
 
     const state = {
         installedAt: Date.now(),
         rescued: 0,
         lastRescue: null,
         wrapDepth: 0,
+        lastStream: null,      // { at, url, bytes, complete, data: Uint8Array, tool }
+        menuInstalled: false,
     };
 
     function log(...args) {
@@ -43,26 +42,36 @@
         try { console.warn(`[${SCRIPT_NAME}]`, ...args); } catch (_) {}
     }
 
-    function notify(message) {
-        const hosts = [];
-        try { hosts.push(window); } catch (_) {}
-        try { if (window.top && window.top !== window) hosts.push(window.top); } catch (_) {}
-        for (const host of hosts) {
+    function hosts() {
+        const list = [];
+        try { list.push(window); } catch (_) {}
+        try { if (window.top && window.top !== window) list.push(window.top); } catch (_) {}
+        return list;
+    }
+
+    function notify(message, level = 'warning') {
+        for (const host of hosts()) {
             try {
                 const t = host.toastr;
-                if (t && typeof t.warning === 'function') {
-                    t.warning(message, SCRIPT_NAME, { timeOut: 8000 });
-                    return;
-                }
+                const fn = t && typeof t[level] === 'function' ? t[level].bind(t) : null;
+                if (fn) { fn(message, SCRIPT_NAME, { timeOut: 8000 }); return; }
             } catch (_) {}
         }
         warn(message);
     }
 
-    // ── 转义还原 ────────────────────────────────────────────────────────────
-    // 把 JSON 字符串内部的内容还原成真实文本：
-    //   \u003c -> <   \n -> 换行   \" -> "   \\ -> \
-    // 注意：部分中转站把 arguments 套了两层转义（\\u003c），所以这里循环解到稳定为止。
+    function stContext() {
+        for (const host of hosts()) {
+            try {
+                if (host.SillyTavern && typeof host.SillyTavern.getContext === 'function') {
+                    return host.SillyTavern.getContext();
+                }
+            } catch (_) {}
+        }
+        return null;
+    }
+
+    // ── 转义还原（中转站常把 arguments 套两层转义，循环解到稳定）─────────────
     function unescapeJsonString(input) {
         let s = String(input ?? '');
         if (!s) return '';
@@ -84,15 +93,11 @@
         return s;
     }
 
-    // ── 从残缺的 arguments 里捞出已经闭合的字符串字段 ──────────────────────
-    // 残缺 JSON 长这样（注意 key 外面还套着一层转义引号）：
-    //   {\"game_content\":\"\u003cgame\u003e...已闭合...\",\"think_nya\":\"写到一半就断了
-    // 我们的目标：只要某个字段的收尾引号还在，就把它的内容完整取出来。
+    // ── 从残缺的 arguments 里捞出已经闭合的字段 ────────────────────────────
+    // \\[^"] 吃掉「反斜杠 + 非引号」，但不会吃掉 \"，所以 \" 只作为字段结束标志
     function extractClosedFields(argsRaw) {
         const out = {};
         if (!argsRaw) return out;
-        // \\[^"] 吃掉「反斜杠 + 非引号」（如 \n \u003c \\），但不允许吃掉 \"
-        // 这样 \" 只会被当作字段结束的标志，不会被误当转义序列
         const re = /\\"([A-Za-z0-9_]+)\\"\s*:\s*\\"((?:\\[^"]|[^\\"])*)\\"/g;
         let m;
         while ((m = re.exec(argsRaw)) !== null) {
@@ -104,7 +109,7 @@
         return out;
     }
 
-    // ── 把抢救出来的字段重新封成合法 SSE ────────────────────────────────────
+    // ── 把抢救出来的内容重封成合法 SSE ──────────────────────────────────────
     function buildSalvageEvents({ fields, toolName, text }) {
         const id = 'chatcmpl-salvage-' + Date.now().toString(36);
         const created = Math.floor(Date.now() / 1000);
@@ -148,8 +153,7 @@
         return out;
     }
 
-    // ── 抢救尾巴 ────────────────────────────────────────────────────────────
-    // tail = 流结束时缓冲区里还没换行的那一坨原始文本
+    // ── 抢救一段原始 SSE 文本 ───────────────────────────────────────────────
     function salvageTail(tail, toolHint) {
         const trimmed = String(tail ?? '').trim();
         if (!trimmed) return null;
@@ -158,31 +162,33 @@
             .split('\n')
             .filter(line => line.startsWith('data:'))
             .map(line => line.slice(5).trim());
-
         if (!dataLines.length) return null;
+
         const raw = dataLines.join('');
 
-        // 工具名：优先从残缺数据里找，找不到就用请求体里的工具名兜底
         let toolName = null;
         const nameMatch = raw.match(/"name"\s*:\s*"([A-Za-z0-9_.\-]+)"/);
         if (nameMatch) toolName = nameMatch[1];
         if (!toolName && toolHint) toolName = toolHint;
 
-        // 1) 优先抢救 tool_calls.arguments
+        // 1) tool_calls.arguments
         const argsMatch = raw.match(/"arguments"\s*:\s*"((?:\\.|[^"\\])*)/);
         if (argsMatch) {
             const fields = extractClosedFields(argsMatch[1]);
             const keys = Object.keys(fields);
             if (keys.length) {
                 const chars = keys.reduce((sum, key) => sum + fields[key].length, 0);
+                const body = fields.game_content || keys.map(k => fields[k]).join('\n\n');
                 return {
                     text: buildSalvageEvents({ fields, toolName }),
                     info: { mode: 'tool_calls', chars, fields: keys, tool: toolName },
+                    fields,
+                    body,
                 };
             }
         }
 
-        // 2) 退一步，抢救普通 content
+        // 2) 普通 content
         const contentMatch = raw.match(/"content"\s*:\s*"((?:\\.|[^"\\])*)/);
         if (contentMatch) {
             const text = unescapeJsonString(contentMatch[1].replace(/\\+$/, ''));
@@ -190,6 +196,8 @@
                 return {
                     text: buildSalvageEvents({ fields: {}, toolName: null, text }),
                     info: { mode: 'content', chars: text.length },
+                    fields: {},
+                    body: text,
                 };
             }
         }
@@ -197,7 +205,7 @@
         return null;
     }
 
-    // ── 从请求体里读工具名（残缺响应常常只给 arguments，不给 name）──────────
+    // ── 从请求体里取工具名（残缺响应常常只给 arguments，不给 name）──────────
     function extractToolName(args) {
         try {
             const options = args && args[1];
@@ -220,8 +228,27 @@
         return null;
     }
 
-    // ── 包装一个 SSE 响应 ───────────────────────────────────────────────────
-    function wrapSseResponse(response, toolHint) {
+    // ── 缓存最近一次响应，供手动抢救 ────────────────────────────────────────
+    function rememberStream(url, toolHint, chunks, total, complete) {
+        try {
+            const data = new Uint8Array(total);
+            let offset = 0;
+            for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.length; }
+            state.lastStream = {
+                at: Date.now(),
+                url: String(url || ''),
+                bytes: total,
+                complete,
+                tool: toolHint || null,
+                data,
+            };
+        } catch (error) {
+            warn('缓存响应失败', error);
+        }
+    }
+
+    // ── 包装 SSE 响应 ───────────────────────────────────────────────────────
+    function wrapSseResponse(response, toolHint, url) {
         let contentType = '';
         try { contentType = String(response.headers.get('content-type') || '').toLowerCase(); } catch (_) {}
         if (!contentType.includes('text/event-stream')) return response;
@@ -231,8 +258,18 @@
         const reader = response.body.getReader();
         const decoder = new TextDecoder('utf-8');
         const encoder = new TextEncoder();
+        const captured = [];
+        let capturedBytes = 0;
         let buffer = '';
         let finished = false;
+
+        const pushCapture = chunk => {
+            if (capturedBytes >= CAPTURE_LIMIT) return;
+            try {
+                captured.push(chunk.slice());
+                capturedBytes += chunk.length;
+            } catch (_) {}
+        };
 
         const emitSalvage = (controller, reason) => {
             const pending = buffer;
@@ -240,14 +277,14 @@
             if (!pending.trim()) return false;
             const rescued = salvageTail(pending, toolHint);
             if (!rescued) {
-                warn(`${reason}：尾巴里没有可抢救的已闭合字段，原样放弃`, pending.slice(0, 200));
+                warn(`${reason}：尾巴里没有可抢救的已闭合字段`);
                 return false;
             }
             try { controller.enqueue(encoder.encode(rescued.text)); } catch (_) { return false; }
             state.rescued += 1;
             state.lastRescue = { at: Date.now(), ...rescued.info };
             warn(`${reason}：已抢救`, rescued.info);
-            notify(`上游断在行内，已从残缺响应里救回 ${rescued.info.chars} 字内容`);
+            notify(`上游断在行内，已自动救回 ${rescued.info.chars} 字内容`);
             return true;
         };
 
@@ -258,10 +295,12 @@
                     const { done, value } = await reader.read();
                     if (done) {
                         finished = true;
-                        emitSalvage(controller, '流出完但尾巴未闭合');
+                        const rescuedOk = emitSalvage(controller, '流出完但尾巴未闭合');
+                        rememberStream(url, toolHint, captured, capturedBytes, !rescuedOk);
                         try { controller.close(); } catch (_) {}
                         return;
                     }
+                    pushCapture(value);
                     buffer += decoder.decode(value, { stream: true });
                     let ready = '';
                     let idx;
@@ -273,11 +312,13 @@
                 } catch (error) {
                     finished = true;
                     emitSalvage(controller, '连接中断(' + (error && error.message ? error.message : error) + ')');
+                    rememberStream(url, toolHint, captured, capturedBytes, false);
                     try { controller.close(); } catch (_) {}
                 }
             },
             cancel(reason) {
                 finished = true;
+                rememberStream(url, toolHint, captured, capturedBytes, false);
                 try { reader.cancel(reason); } catch (_) {}
             },
         });
@@ -294,25 +335,28 @@
         return wrapped;
     }
 
-    // ── 安装 fetch 钩子，并保证永远在最外层 ─────────────────────────────────
+    // ── 安装 fetch 钩子，保证在最外层 ───────────────────────────────────────
     function installOnce() {
+        if (state.wrapDepth >= MAX_WRAP_DEPTH) return;
         const current = window.fetch;
         if (typeof current !== 'function') return;
-        if (current[WRAP_MARK]) return; // 已经是我们，且在最外层
+        if (current[WRAP_MARK]) return;
 
         const inner = current;
         const wrapped = async function (...args) {
+            const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+            // 只处理聊天补全，其余请求原样放行
+            if (!CHAT_ENDPOINT.test(url)) return inner.apply(this, args);
             const toolHint = extractToolName(args);
             const response = await inner.apply(this, args);
             try {
-                return wrapSseResponse(response, toolHint);
+                return wrapSseResponse(response, toolHint, url);
             } catch (error) {
                 warn('包装响应失败，按原样返回', error);
                 return response;
             }
         };
         try { Object.defineProperty(wrapped, WRAP_MARK, { value: true }); } catch (_) {}
-        try { Object.defineProperty(wrapped, 'name', { value: 'fetch' }); } catch (_) {}
 
         window.fetch = wrapped;
         state.wrapDepth += 1;
@@ -322,26 +366,144 @@
         try { installOnce(); } catch (error) { warn('安装失败', error); }
     }
 
+    // ── 手动抢救：把缓存里的正文写进聊天 ────────────────────────────────────
+    async function rescueIntoChat() {
+        const record = state.lastStream;
+        if (!record || !record.bytes) {
+            notify('还没有抓到可抢救的响应，先触发一次空回再说');
+            return;
+        }
+
+        let text = '';
+        try {
+            text = new TextDecoder('utf-8').decode(record.data);
+        } catch (error) {
+            notify('缓存读取失败：' + error.message);
+            return;
+        }
+
+        const rescued = salvageTail(text, record.tool);
+        if (!rescued || !rescued.body || !rescued.body.trim()) {
+            notify('这次缓存里没有完整的正文，无法抢救（可能上游一个字都没推）');
+            return;
+        }
+
+        const ctx = stContext();
+        if (!ctx || !Array.isArray(ctx.chat)) {
+            notify('没拿到酒馆上下文，无法写入聊天');
+            return;
+        }
+
+        const message = {
+            name: ctx.name2 || 'Assistant',
+            is_user: false,
+            is_system: false,
+            send_date: Date.now(),
+            mes: rescued.body,
+            extra: { streamSalvage: true },
+        };
+
+        try {
+            ctx.chat.push(message);
+            if (typeof ctx.saveChat === 'function') await ctx.saveChat();
+            if (typeof ctx.addOneMessage === 'function') {
+                ctx.addOneMessage(message, { scroll: true });
+            } else if (typeof ctx.reloadCurrentChat === 'function') {
+                await ctx.reloadCurrentChat();
+            }
+            notify(`已把 ${rescued.body.length} 字正文救进当前聊天`);
+            log('手动抢救完成', rescued.info);
+        } catch (error) {
+            notify('写入聊天失败：' + error.message);
+        }
+    }
+
+    // ── 在魔法棒菜单里挂一个「空回抢救」按钮 ────────────────────────────────
+    function installMenuButton() {
+        try {
+            if (state.menuInstalled && document.getElementById('ss-rescue-menu-item')) return;
+            const menu = document.getElementById('extensionsMenu');
+            if (!menu) return;
+            if (document.getElementById('ss-rescue-menu-item')) { state.menuInstalled = true; return; }
+
+            const container = document.createElement('div');
+            container.id = 'ss-rescue-menu-item';
+            container.className = 'extension_container interactable';
+            container.title = '把上一次空回的正文救进当前聊天';
+            container.innerHTML = `
+                <div class="list-group-item flex-container flexGap5">
+                    <div class="fa-solid fa-kit-medical extensionsMenuExtensionButton"></div>
+                    <span>空回抢救</span>
+                </div>`;
+            container.addEventListener('click', event => {
+                event.stopPropagation();
+                rescueIntoChat();
+            });
+            menu.appendChild(container);
+            state.menuInstalled = true;
+            log('「空回抢救」按钮已挂到扩展菜单');
+        } catch (error) {
+            warn('挂按钮失败', error);
+        }
+    }
+
+    // ── 设置面板状态刷新 ────────────────────────────────────────────────────
+    function refreshPanel() {
+        try {
+            if (!document.getElementById('stream-salvage-panel')) return;
+            const set = (id, text) => {
+                const el = document.getElementById(id);
+                if (el && el.textContent !== text) el.textContent = text;
+            };
+            set('ss-rescued', String(state.rescued));
+            set('ss-hooks', String(state.wrapDepth));
+            set('ss-outer', window.fetch && window.fetch[WRAP_MARK] ? '是' : '否');
+            const last = state.lastRescue;
+            set('ss-last', last ? `${last.chars} 字 · ${last.mode}${last.tool ? ' · ' + last.tool : ''}` : '—');
+
+            const cached = state.lastStream;
+            set('ss-cached', cached ? `${cached.bytes} 字节 · ${cached.complete ? '完整' : '断流'}` : '—');
+
+            const btn = document.getElementById('ss-reinstall');
+            if (btn && !btn.__ssBound) {
+                btn.__ssBound = true;
+                btn.addEventListener('click', () => {
+                    state.wrapDepth = 0;
+                    ensureOutermost();
+                    refreshPanel();
+                });
+            }
+        } catch (_) {}
+    }
+
+    // ── 启动 ────────────────────────────────────────────────────────────────
     ensureOutermost();
     setInterval(ensureOutermost, GUARD_MS);
+    setInterval(() => { installMenuButton(); refreshPanel(); }, 1200);
+    setTimeout(installMenuButton, 300);
+    setTimeout(installMenuButton, 1500);
+    setTimeout(installMenuButton, 4000);
 
-    // ── 对外暴露一点调试信息 ────────────────────────────────────────────────
     try {
         window.__streamSalvage__ = {
             version: VERSION,
             status() {
+                const cached = state.lastStream;
                 return {
                     installedAt: state.installedAt,
                     rescued: state.rescued,
                     lastRescue: state.lastRescue,
                     outermost: Boolean(window.fetch && window.fetch[WRAP_MARK]),
                     wrapDepth: state.wrapDepth,
+                    menuInstalled: state.menuInstalled,
+                    cached: cached ? { bytes: cached.bytes, complete: cached.complete, at: cached.at } : null,
                 };
             },
+            rescue: rescueIntoChat,
             salvageTail,
-            reinstall: ensureOutermost,
+            reinstall() { state.wrapDepth = 0; ensureOutermost(); },
         };
     } catch (_) {}
 
-    log(`v${VERSION} 已加载，正在监视 SSE 流（每 ${GUARD_MS}ms 校准一次最外层）`);
+    log(`v${VERSION} 已加载`);
 })();
