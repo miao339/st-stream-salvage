@@ -16,12 +16,15 @@
     'use strict';
 
     const SCRIPT_NAME = '流式抢救 · Stream Salvage';
-    const VERSION = '1.2.0';
+    const VERSION = '1.3.0';
     const WRAP_MARK = '__streamSalvageOuter__';
     const GUARD_MS = 800;
     const MAX_WRAP_DEPTH = 3;
     const CAPTURE_LIMIT = 8 * 1024 * 1024;
     const REPO = 'miao339/st-stream-salvage';
+    // 双马尾（流式抗截断）把 window.fetch 直接赋值成自己的包装，
+    // 但会保留 original 链。顺着这条链就能判断我们还在不在。
+    const PEER_MARKER = '__unicodeFloorInterceptor_fetch_v3__';
     const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1000;
     // 直连 GitHub 国内基本不通，按顺序试镜像，第一个成功的就用
     const UPDATE_MIRRORS = [
@@ -307,27 +310,31 @@
         return null;
     }
 
-    // ── 从请求体里取工具名（残缺响应常常只给 arguments，不给 name）──────────
-    function extractToolName(args) {
+    // ── 从请求体里取工具名和 stream 标记 ───────────────────────────────────
+    // 残缺响应常常只给 arguments 不给 name；另外部分后端转发的响应没有 content-type，
+    // 只能靠请求体里的 stream:true 判断这是不是流式请求。
+    function extractRequestMeta(args) {
+        const meta = { toolName: null, stream: null };
         try {
             const options = args && args[1];
-            if (!options) return null;
+            if (!options) return meta;
             let body = options.body;
             if (typeof body !== 'string') {
                 if (body instanceof ArrayBuffer) body = new TextDecoder().decode(body);
                 else if (ArrayBuffer.isView(body)) body = new TextDecoder().decode(body);
-                else return null;
+                else return meta;
             }
-            if (!body || body.length > 4 * 1024 * 1024) return null;
+            if (!body || body.length > 4 * 1024 * 1024) return meta;
             const parsed = JSON.parse(body);
+            if (parsed && typeof parsed.stream === 'boolean') meta.stream = parsed.stream;
             const tools = parsed && parsed.tools;
-            if (!Array.isArray(tools)) return null;
+            if (!Array.isArray(tools)) return meta;
             for (const tool of tools) {
                 const name = tool && ((tool.function && tool.function.name) || tool.name);
-                if (typeof name === 'string' && name) return name;
+                if (typeof name === 'string' && name) { meta.toolName = name; return meta; }
             }
         } catch (_) {}
-        return null;
+        return meta;
     }
 
     // ── 缓存最近一次响应，供手动抢救 ────────────────────────────────────────
@@ -358,102 +365,97 @@
     }
 
     // ── 包装 SSE 响应 ───────────────────────────────────────────────────────
-    function wrapSseResponse(response, toolHint, url) {
+    // ── 旁听捕获：克隆一份响应读下来存档，原流一个字节都不碰 ────────────────
+    // 这是最安全的形态：不管读成功还是失败，酒馆收到的永远是原始响应。
+    function captureResponse(response, toolHint, url, streamRequested) {
         let contentType = '';
         try { contentType = String(response.headers.get('content-type') || '').toLowerCase(); } catch (_) {}
-        if (!contentType.includes('text/event-stream')) return response;
+        const looksSse = contentType.includes('text/event-stream');
+        if (!looksSse && streamRequested !== true) return response;
         if (!response.body) return response;
-        if (response.__streamSalvage) return response;
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder('utf-8');
-        const encoder = new TextEncoder();
-        const captured = [];
-        let capturedBytes = 0;
-        let buffer = '';
-        let finished = false;
+        // 用 tee 把流分成两支：一支交给酒馆，一支留给自己读。
+        // 比 response.clone() 稳，clone 对某些流会直接抛错。
+        let branches;
+        try {
+            branches = response.body.tee();
+        } catch (error) {
+            warn('分流失败，放弃捕获', error);
+            state.captureError = 'tee: ' + (error && error.message);
+            return response;
+        }
+        const [forClient, forUs] = branches;
 
-        const pushCapture = chunk => {
-            if (capturedBytes >= CAPTURE_LIMIT) return;
+        (async () => {
             try {
-                captured.push(chunk.slice());
-                capturedBytes += chunk.length;
-            } catch (_) {}
-        };
-
-        const emitSalvage = (controller, reason) => {
-            const pending = buffer;
-            buffer = '';
-            if (!pending.trim()) return false;
-            const rescued = salvageTail(pending, toolHint);
-            if (!rescued) {
-                // 救不了就把原始尾巴原样吐出去，绝不吞数据。
-                // 等于退化回「没装这个插件」的状态，下游爱怎么处理怎么处理。
-                warn(`${reason}：尾巴里没有可抢救的已闭合字段，原样放行`);
-                try { controller.enqueue(encoder.encode(pending)); } catch (_) {}
-                return false;
-            }
-            try { controller.enqueue(encoder.encode(rescued.text)); } catch (_) { return false; }
-            state.rescued += 1;
-            state.lastRescue = { at: Date.now(), ...rescued.info };
-            warn(`${reason}：已抢救`, rescued.info);
-            notify(`上游断在行内，已自动救回 ${rescued.info.chars} 字内容`);
-            return true;
-        };
-
-        const stream = new ReadableStream({
-            async pull(controller) {
-                if (finished) return;
-                try {
+                const reader = forUs.getReader();
+                const chunks = [];
+                let total = 0;
+                while (true) {
                     const { done, value } = await reader.read();
-                    if (done) {
-                        finished = true;
-                        const rescuedOk = emitSalvage(controller, '流出完但尾巴未闭合');
-                        rememberStream(url, toolHint, captured, capturedBytes, !rescuedOk);
-                        try { controller.close(); } catch (_) {}
-                        return;
-                    }
-                    pushCapture(value);
-                    buffer += decoder.decode(value, { stream: true });
-                    let ready = '';
-                    let idx;
-                    while ((idx = buffer.indexOf('\n')) >= 0) {
-                        ready += buffer.slice(0, idx + 1);
-                        buffer = buffer.slice(idx + 1);
-                    }
-                    if (ready) controller.enqueue(encoder.encode(ready));
-                } catch (error) {
-                    finished = true;
-                    emitSalvage(controller, '连接中断(' + (error && error.message ? error.message : error) + ')');
-                    rememberStream(url, toolHint, captured, capturedBytes, false);
-                    try { controller.close(); } catch (_) {}
+                    if (done) break;
+                    if (total < CAPTURE_LIMIT) { chunks.push(value.slice()); total += value.length; }
                 }
-            },
-            cancel(reason) {
-                finished = true;
-                rememberStream(url, toolHint, captured, capturedBytes, false);
-                try { reader.cancel(reason); } catch (_) {}
-            },
-        });
 
+                const data = new Uint8Array(total);
+                let offset = 0;
+                for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.length; }
+
+                let tailText = '';
+                try { tailText = new TextDecoder('utf-8').decode(data.slice(Math.max(0, total - 4096))); } catch (_) {}
+                const complete = tailText.includes('[DONE]');
+
+                state.lastStream = { at: Date.now(), url: String(url || ''), bytes: total, complete, tool: toolHint || null, data };
+
+                if (!complete) {
+                    let text = '';
+                    try { text = new TextDecoder('utf-8').decode(data); } catch (_) {}
+                    const rescued = salvageTail(text, toolHint);
+                    if (rescued) {
+                        state.lastRescue = { at: Date.now(), ...rescued.info };
+                        notify(`检测到断流，打开「空回助手」可救回 ${rescued.info.chars} 字`);
+                    } else {
+                        warn('检测到断流，但没有完整的正文可救', { bytes: total });
+                    }
+                }
+            } catch (error) {
+                warn('旁听捕获中断', error);
+                state.captureError = 'read: ' + (error && error.message);
+            }
+        })();
+
+        // 返回给酒馆的那一支：内容和原响应完全一样
         const headers = new Headers(response.headers);
         headers.delete('content-length');
-
-        const wrapped = new Response(stream, {
+        return new Response(forClient, {
             status: response.status,
             statusText: response.statusText,
             headers,
         });
-        try { Object.defineProperty(wrapped, '__streamSalvage', { value: true }); } catch (_) {}
-        return wrapped;
     }
 
-    // ── 安装 fetch 钩子，保证在最外层 ───────────────────────────────────────
+    function wrapSseResponse(response, toolHint, url, streamRequested) {
+        return captureResponse(response, toolHint, url, streamRequested);
+    }
+
+    // ── 安装 fetch 钩子：只要还在链里就不动，掉出链才重包 ────────────────────
+    function chainHasOurs(fn) {
+        let cur = fn;
+        let depth = 0;
+        while (typeof cur === 'function' && depth++ < 60) {
+            if (cur[WRAP_MARK]) return true;
+            const meta = cur[PEER_MARKER];
+            if (meta && typeof meta.original === 'function') { cur = meta.original; continue; }
+            break;
+        }
+        return false;
+    }
+
     function installOnce() {
-        if (state.wrapDepth >= MAX_WRAP_DEPTH) return;
         const current = window.fetch;
         if (typeof current !== 'function') return;
-        if (current[WRAP_MARK]) return;
+        if (current[WRAP_MARK]) return;          // 已经是最外层，就是我们
+        if (chainHasOurs(current)) return;       // 在别人的 original 链里，仍然生效，不用重包
 
         const inner = current;
         const wrapped = async function (...args) {
@@ -462,16 +464,27 @@
             if (!state.enabled) return inner.apply(this, args);
             // 只处理聊天补全，其余请求原样放行
             if (!CHAT_ENDPOINT.test(url)) return inner.apply(this, args);
-            const toolHint = extractToolName(args);
+            const meta = extractRequestMeta(args);
             const response = await inner.apply(this, args);
             try {
-                return wrapSseResponse(response, toolHint, url);
+                state.lastSeen = {
+                    at: Date.now(),
+                    url: String(url).slice(0, 100),
+                    ct: response.headers.get('content-type'),
+                    hasBody: Boolean(response.body),
+                    streamReq: meta.stream,
+                    alreadyWrapped: Boolean(response.__streamSalvage),
+                };
+            } catch (_) {}
+            try {
+                return wrapSseResponse(response, meta.toolName, url, meta.stream);
             } catch (error) {
                 warn('包装响应失败，按原样返回', error);
                 return response;
             }
         };
         try { Object.defineProperty(wrapped, WRAP_MARK, { value: true }); } catch (_) {}
+        try { Object.defineProperty(wrapped, 'name', { value: 'fetch' }); } catch (_) {}
 
         window.fetch = wrapped;
         state.wrapDepth += 1;
@@ -765,6 +778,8 @@
                     outermost: Boolean(window.fetch && window.fetch[WRAP_MARK]),
                     wrapDepth: state.wrapDepth,
                     menuInstalled: state.menuInstalled,
+                    lastSeen: state.lastSeen || null,
+                    captureError: state.captureError || null,
                     cached: cached ? { bytes: cached.bytes, complete: cached.complete, at: cached.at } : null,
                 };
             },
