@@ -16,20 +16,38 @@
     'use strict';
 
     const SCRIPT_NAME = '流式抢救 · Stream Salvage';
-    const VERSION = '1.1.0';
+    const VERSION = '1.2.0';
     const WRAP_MARK = '__streamSalvageOuter__';
     const GUARD_MS = 800;
     const MAX_WRAP_DEPTH = 3;
     const CAPTURE_LIMIT = 8 * 1024 * 1024;
+    const REPO = 'miao339/st-stream-salvage';
+    const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1000;
+    // 直连 GitHub 国内基本不通，按顺序试镜像，第一个成功的就用
+    const UPDATE_MIRRORS = [
+        `https://ghproxy.net/https://raw.githubusercontent.com/${REPO}/master/manifest.json`,
+        `https://gh-proxy.com/https://raw.githubusercontent.com/${REPO}/master/manifest.json`,
+        `https://cdn.jsdelivr.net/gh/${REPO}@master/manifest.json`,
+        `https://raw.githubusercontent.com/${REPO}/master/manifest.json`,
+    ];
     // 只接管聊天补全端点。别的请求（模型列表、存档、图片、世界书）一个字都不碰，
     // 原样调用 inner.fetch，不解析也不拷贝，避免和任何其他插件抢活。
     const CHAT_ENDPOINT = /\/(?:api\/backends\/chat-completions\/generate|api\/backends\/text-completions\/generate|v1\/chat\/completions|chat\/completions|generateContent)(?:[?#]|$)/i;
 
     const PREF_KEY = 'streamSalvage.enabled';
+    const PREF_AUTO_UPDATE = 'streamSalvage.autoUpdate';
+    const PREF_LAST_CHECK = 'streamSalvage.lastCheck';
 
     function loadEnabled() {
         try {
             const raw = localStorage.getItem(PREF_KEY);
+            return raw === null ? true : raw === '1';
+        } catch (_) { return true; }
+    }
+
+    function loadAutoUpdate() {
+        try {
+            const raw = localStorage.getItem(PREF_AUTO_UPDATE);
             return raw === null ? true : raw === '1';
         } catch (_) { return true; }
     }
@@ -42,7 +60,75 @@
         lastStream: null,      // { at, url, bytes, complete, data: Uint8Array, tool }
         menuInstalled: false,
         enabled: loadEnabled(),
+        autoUpdate: loadAutoUpdate(),
+        update: { checkedAt: 0, latest: null, source: '', error: null, checking: false },
     };
+
+    function setAutoUpdate(value) {
+        state.autoUpdate = Boolean(value);
+        try { localStorage.setItem(PREF_AUTO_UPDATE, state.autoUpdate ? '1' : '0'); } catch (_) {}
+        notify(state.autoUpdate ? '自动检查更新：已开启' : '自动检查更新：已关闭');
+    }
+
+    function cmpVersion(a, b) {
+        const pa = String(a || '0').split('.').map(n => parseInt(n, 10) || 0);
+        const pb = String(b || '0').split('.').map(n => parseInt(n, 10) || 0);
+        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+            const x = pa[i] || 0;
+            const y = pb[i] || 0;
+            if (x > y) return 1;
+            if (x < y) return -1;
+        }
+        return 0;
+    }
+
+    async function checkUpdate(silent = false) {
+        if (state.update.checking) return state.update;
+        state.update.checking = true;
+        let result = null;
+        for (const url of UPDATE_MIRRORS) {
+            try {
+                const r = await fetch(url, { cache: 'no-store' });
+                if (!r.ok) continue;
+                const j = await r.json();
+                if (j && j.version) { result = { version: String(j.version), source: url }; break; }
+            } catch (_) {}
+        }
+        state.update = {
+            checkedAt: Date.now(),
+            latest: result ? result.version : null,
+            source: result ? result.source : '',
+            error: result ? null : '所有镜像都取不到版本信息',
+            checking: false,
+        };
+        try { localStorage.setItem(PREF_LAST_CHECK, String(state.update.checkedAt)); } catch (_) {}
+
+        if (!silent) {
+            if (!result) notify('检查更新失败：网络不通，稍后再试');
+            else if (cmpVersion(result.version, VERSION) > 0) notify(`发现新版本 v${result.version}（当前 v${VERSION}）`);
+            else notify(`已是最新版本 v${VERSION}`);
+        }
+        return state.update;
+    }
+
+    async function doUpdate() {
+        const ctx = stContext();
+        if (!ctx) { notify('拿不到酒馆上下文，无法更新'); return; }
+        const headers = typeof ctx.getRequestHeaders === 'function' ? ctx.getRequestHeaders() : {};
+        try {
+            notify('正在更新，请稍候…');
+            const r = await fetch('/api/extensions/update', {
+                method: 'POST',
+                headers: { ...headers, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ extensionName: 'st-stream-salvage', global: false }),
+            });
+            const j = await r.json().catch(() => ({}));
+            if (r.ok) notify('更新完成，刷新酒馆页面生效');
+            else notify('更新失败：' + (j.error || j.message || ('HTTP ' + r.status)) + '（GitHub 不通时可能拉不到，可手动重装）');
+        } catch (error) {
+            notify('更新失败：' + error.message + '（可手动重装）');
+        }
+    }
 
     function setEnabled(value) {
         state.enabled = Boolean(value);
@@ -456,9 +542,11 @@
     function openAssistant() {
         try {
             buildAssistantPanel();
+            return { ok: true };
         } catch (error) {
             warn('打开空回助手失败', error);
             notify('打开空回助手失败：' + (error && error.message ? error.message : error));
+            return { ok: false, error: String((error && error.stack) || error) };
         }
     }
 
@@ -498,6 +586,17 @@
             <div style="font-size:.85em;opacity:.55;margin-top:7px;line-height:1.55;">
                 空回之后、还没发下一条消息时点它，会把上一次响应里写好的正文直接写进聊天。再发一次缓存就被覆盖了。
             </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding-top:9px;margin-top:9px;border-top:1px solid var(--SmartThemeBorderColor);">
+                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                    <input type="checkbox" id="ss-auto-update" ${state.autoUpdate ? 'checked' : ''} style="margin:0;">
+                    <span style="font-size:.9em;">自动检查更新</span>
+                </label>
+                <div class="menu_button" id="ss-check-update" style="margin:0;width:fit-content;font-size:.88em;padding:2px 10px;">检查更新</div>
+            </div>
+            <div id="ss-update-info" style="font-size:.82em;opacity:.55;margin-top:5px;line-height:1.5;">
+                当前 v${VERSION}
+            </div>
         </div>`;
 
         // 贴底部输出框：插到 form_sheld 前面，跟着布局走，不弹居中窗
@@ -514,8 +613,6 @@
             'font-size:.94em',
             'line-height:1.6',
             'text-align:left',
-            'max-height:52vh',
-            'overflow-y:auto',
         ].join(';');
         panel.innerHTML = html;
 
@@ -533,6 +630,36 @@
             event.stopPropagation();
             panel.remove();
         });
+
+        // 更新区
+        const autoCb = panel.querySelector('#ss-auto-update');
+        if (autoCb) autoCb.addEventListener('change', event => setAutoUpdate(event.target.checked));
+
+        const upInfo = panel.querySelector('#ss-update-info');
+        const renderUpdateInfo = () => {
+            if (!upInfo) return;
+            const u = state.update;
+            if (u.checking) { upInfo.textContent = '正在检查…'; return; }
+            if (!u.checkedAt) { upInfo.textContent = `当前 v${VERSION}`; return; }
+            if (u.error) { upInfo.textContent = `当前 v${VERSION} · 检查失败：${u.error}`; return; }
+            if (cmpVersion(u.latest, VERSION) > 0) {
+                upInfo.innerHTML = `当前 v${VERSION} · 发现新版本 v${u.latest} ` +
+                    `<span class="menu_button" id="ss-do-update" style="display:inline-block;margin:0 0 0 6px;padding:1px 8px;font-size:.95em;">立即更新</span>`;
+                const doBtn = upInfo.querySelector('#ss-do-update');
+                if (doBtn) doBtn.addEventListener('click', event => { event.stopPropagation(); doUpdate(); });
+            } else {
+                upInfo.textContent = `当前 v${VERSION} · 已是最新`;
+            }
+        };
+
+        const checkBtn = panel.querySelector('#ss-check-update');
+        if (checkBtn) checkBtn.addEventListener('click', async event => {
+            event.stopPropagation();
+            if (upInfo) upInfo.textContent = '正在检查…';
+            await checkUpdate(false);
+            renderUpdateInfo();
+        });
+        renderUpdateInfo();
 
         let detached = false;
         const onOutside = event => {
@@ -609,6 +736,18 @@
     ensureOutermost();
     setInterval(ensureOutermost, GUARD_MS);
     setInterval(() => { installMenuButton(); refreshPanel(); }, 1200);
+
+    // 自动检查更新：开页面时若超过间隔就查一次，之后每 30 分钟看一次是否到期
+    (function scheduleUpdateCheck() {
+        const due = () => {
+            if (!state.autoUpdate) return false;
+            let last = 0;
+            try { last = Number(localStorage.getItem(PREF_LAST_CHECK) || 0); } catch (_) {}
+            return Date.now() - last > UPDATE_CHECK_INTERVAL;
+        };
+        setTimeout(() => { if (due()) checkUpdate(true); }, 6000);
+        setInterval(() => { if (due()) checkUpdate(true); }, 30 * 60 * 1000);
+    })();
     setTimeout(installMenuButton, 300);
     setTimeout(installMenuButton, 1500);
     setTimeout(installMenuButton, 4000);
@@ -630,6 +769,9 @@
                 };
             },
             rescue: rescueIntoChat,
+            openAssistant,
+            checkUpdate,
+            update: doUpdate,
             salvageTail,
             reinstall() { state.wrapDepth = 0; ensureOutermost(); },
         };
