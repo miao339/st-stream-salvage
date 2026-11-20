@@ -459,28 +459,32 @@
         const cached = state.lastStream;
 
         const html = `
-        <div style="text-align:left;line-height:1.7;">
-            <h3 style="margin:0 0 8px;">空回助手</h3>
-            <p style="margin:0 0 10px;opacity:.85;">
-                站点是假流式，最后一次性把整段推回来。推不完整，酒馆解析不出内容就整段丢掉，于是空白。
-                插件在这一截没收尾时，把已经写好的部分救出来，重新交给酒馆。只接管聊天补全请求，其它不碰。
+        <div style="text-align:left;line-height:1.6;font-size:.94em;">
+            <h3 style="margin:0 0 6px;font-size:1.05em;">空回助手</h3>
+            <p style="margin:0 0 6px;opacity:.85;">
+                站点是假流式，最后一次性把整段推回来。推不完整酒馆就整段丢掉，于是空白。
+                插件在这一截没收尾时，把已经写好的部分救出来交给酒馆。
             </p>
-            <label style="display:flex;align-items:center;gap:8px;padding:10px 0;border-top:1px solid var(--SmartThemeBorderColor);">
-                <input type="checkbox" id="ss-assistant-enable" ${state.enabled ? 'checked' : ''}>
+            <p style="margin:0 0 10px;opacity:.55;font-size:.9em;">
+                只接管聊天补全请求，其它一概不碰。
+            </p>
+
+            <label style="display:flex;align-items:center;gap:8px;padding:9px 0;border-top:1px solid var(--SmartThemeBorderColor);cursor:pointer;">
+                <input type="checkbox" id="ss-assistant-enable" ${state.enabled ? 'checked' : ''} style="margin:0;">
                 <span>启用自动抢救</span>
             </label>
-            <div style="font-size:.92em;opacity:.8;line-height:1.6;">
-                已抢救：<b>${state.rescued}</b> 次<br>
-                最近一次：${last ? `${last.chars} 字 · ${last.mode}` : '—'}<br>
-                已缓存：${cached ? `${cached.bytes} 字节 · ${cached.complete ? '完整' : '断流'}` : '—'}
+
+            <div style="padding:8px 0;border-top:1px solid var(--SmartThemeBorderColor);font-size:.9em;opacity:.85;line-height:1.7;">
+                <div style="display:flex;justify-content:space-between;gap:12px;"><span>已抢救</span><span>${state.rescued} 次</span></div>
+                <div style="display:flex;justify-content:space-between;gap:12px;"><span>最近一次</span><span>${last ? `${last.chars} 字 · ${last.mode}` : '—'}</span></div>
+                <div style="display:flex;justify-content:space-between;gap:12px;"><span>已缓存</span><span>${cached ? `${cached.bytes} 字节 · ${cached.complete ? '完整' : '断流'}` : '—'}</span></div>
             </div>
-            <div class="menu_button" id="ss-assistant-rescue" style="margin-top:12px;width:fit-content;">
+
+            <div class="menu_button" id="ss-assistant-rescue" style="margin-top:10px;width:fit-content;">
                 从缓存立即抢救一次
             </div>
-            <div style="font-size:.86em;opacity:.65;margin-top:8px;line-height:1.6;">
-                什么时候点：空回之后（转圈结束、聊天框空着），趁还没发下一条消息时点。
-                它会从上面那份缓存里把正文提取出来，直接写进当前聊天。
-                再发一次消息，缓存就会被新的一份覆盖，到时候就救不回来了。
+            <div style="font-size:.85em;opacity:.55;margin-top:7px;line-height:1.55;">
+                空回之后、还没发下一条消息时点它，会把上一次响应里写好的正文直接写进聊天。再发一次缓存就被覆盖了。
             </div>
         </div>`;
 
@@ -490,19 +494,50 @@
             return;
         }
 
+        // 点面板外面（酒馆空白处）就关掉
+        let closing = false;
+        const detach = () => document.removeEventListener('mousedown', onOutside, true);
+        const closePopup = () => {
+            if (closing) return;
+            closing = true;
+            try {
+                if (typeof ctx.hidePopup === 'function') ctx.hidePopup();
+                else {
+                    const ok = document.querySelector('.popup .popup-button-ok');
+                    if (ok) ok.click();
+                }
+            } catch (_) {}
+            detach();
+        };
+        const onOutside = event => {
+            const popup = document.querySelector('.popup');
+            if (!popup) { detach(); return; }
+            if (popup.contains(event.target)) return;
+            closePopup();
+        };
+
+        let popupPromise;
         try {
-            ctx.callGenericPopup(html, ctx.POPUP_TYPE.TEXT, '', { wide: true, okButton: '关闭', cancelButton: false });
+            popupPromise = ctx.callGenericPopup(html, ctx.POPUP_TYPE.TEXT, '', {
+                wide: true,
+                okButton: '关闭',
+                cancelButton: false,
+                allowVerticalScrolling: true,
+            });
         } catch (error) {
             notify('打开面板失败：' + error.message);
             return;
         }
 
         setTimeout(() => {
+            document.addEventListener('mousedown', onOutside, true);
             const cb = document.getElementById('ss-assistant-enable');
             if (cb) cb.addEventListener('change', event => setEnabled(event.target.checked));
             const btn = document.getElementById('ss-assistant-rescue');
             if (btn) btn.addEventListener('click', () => rescueIntoChat());
-        }, 150);
+        }, 200);
+
+        Promise.resolve(popupPromise).finally(detach);
     }
 
     // ── 在魔法棒菜单里挂「空回助手」入口 ────────────────────────────────────
