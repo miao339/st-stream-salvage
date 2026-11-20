@@ -453,14 +453,26 @@
     }
 
     // ── 空回助手：说明 + 开关 + 状态 ────────────────────────────────────────
-    async function openAssistant() {
-        const ctx = stContext();
+    function openAssistant() {
+        try {
+            buildAssistantPanel();
+        } catch (error) {
+            warn('打开空回助手失败', error);
+            notify('打开空回助手失败：' + (error && error.message ? error.message : error));
+        }
+    }
+
+    function buildAssistantPanel() {
+        const existing = document.getElementById('ss-assistant-panel');
+        if (existing) { existing.remove(); return; }
+
         const last = state.lastRescue;
         const cached = state.lastStream;
 
         const html = `
-        <div style="text-align:left;line-height:1.6;font-size:.94em;">
-            <h3 style="margin:0 0 6px;font-size:1.05em;">空回助手</h3>
+        <div style="text-align:left;line-height:1.6;font-size:.94em;position:relative;">
+            <button id="ss-assistant-close" title="关闭" style="position:absolute;top:-2px;right:-4px;background:none;border:none;color:inherit;opacity:.5;cursor:pointer;font-size:1.05em;line-height:1;padding:4px 6px;">✕</button>
+            <h3 style="margin:0 0 6px;font-size:1.05em;padding-right:24px;">空回助手</h3>
             <p style="margin:0 0 6px;opacity:.85;">
                 站点是假流式，最后一次性把整段推回来。推不完整酒馆就整段丢掉，于是空白。
                 插件在这一截没收尾时，把已经写好的部分救出来交给酒馆。
@@ -488,56 +500,51 @@
             </div>
         </div>`;
 
-        if (!ctx || typeof ctx.callGenericPopup !== 'function') {
-            setEnabled(!state.enabled);
-            notify('当前酒馆不支持弹窗，已直接切换开关');
-            return;
-        }
+        // 贴底部输出框：插到 form_sheld 前面，跟着布局走，不弹居中窗
+        const panel = document.createElement('div');
+        panel.id = 'ss-assistant-panel';
+        panel.style.cssText = [
+            'position:relative',
+            'margin:0 0 6px 0',
+            'padding:10px 14px',
+            'border:1px solid var(--SmartThemeBorderColor)',
+            'border-radius:10px',
+            'background:var(--SmartThemeBlurTintColor,rgba(20,20,20,.94))',
+            'box-shadow:0 6px 18px rgba(0,0,0,.35)',
+            'font-size:.94em',
+            'line-height:1.6',
+            'text-align:left',
+            'max-height:52vh',
+            'overflow-y:auto',
+        ].join(';');
+        panel.innerHTML = html;
 
-        // 点面板外面（酒馆空白处）就关掉
-        let closing = false;
-        const detach = () => document.removeEventListener('mousedown', onOutside, true);
-        const closePopup = () => {
-            if (closing) return;
-            closing = true;
-            try {
-                if (typeof ctx.hidePopup === 'function') ctx.hidePopup();
-                else {
-                    const ok = document.querySelector('.popup .popup-button-ok');
-                    if (ok) ok.click();
-                }
-            } catch (_) {}
-            detach();
-        };
+        const host = document.getElementById('form_sheld') || document.getElementById('send_form');
+        const parent = (host && host.parentElement) || document.getElementById('sheld') || document.body;
+        if (host && host.parentElement === parent) parent.insertBefore(panel, host);
+        else parent.appendChild(panel);
+
+        const cb = panel.querySelector('#ss-assistant-enable');
+        if (cb) cb.addEventListener('change', event => setEnabled(event.target.checked));
+        const btn = panel.querySelector('#ss-assistant-rescue');
+        if (btn) btn.addEventListener('click', () => rescueIntoChat());
+        const closeBtn = panel.querySelector('#ss-assistant-close');
+        if (closeBtn) closeBtn.addEventListener('click', event => {
+            event.stopPropagation();
+            panel.remove();
+        });
+
+        let detached = false;
         const onOutside = event => {
-            const popup = document.querySelector('.popup');
-            if (!popup) { detach(); return; }
-            if (popup.contains(event.target)) return;
-            closePopup();
+            if (detached) return;
+            const current = document.getElementById('ss-assistant-panel');
+            if (!current) { document.removeEventListener('mousedown', onOutside, true); return; }
+            if (current.contains(event.target)) return;
+            detached = true;
+            current.remove();
+            document.removeEventListener('mousedown', onOutside, true);
         };
-
-        let popupPromise;
-        try {
-            popupPromise = ctx.callGenericPopup(html, ctx.POPUP_TYPE.TEXT, '', {
-                wide: true,
-                okButton: '关闭',
-                cancelButton: false,
-                allowVerticalScrolling: true,
-            });
-        } catch (error) {
-            notify('打开面板失败：' + error.message);
-            return;
-        }
-
-        setTimeout(() => {
-            document.addEventListener('mousedown', onOutside, true);
-            const cb = document.getElementById('ss-assistant-enable');
-            if (cb) cb.addEventListener('change', event => setEnabled(event.target.checked));
-            const btn = document.getElementById('ss-assistant-rescue');
-            if (btn) btn.addEventListener('click', () => rescueIntoChat());
-        }, 200);
-
-        Promise.resolve(popupPromise).finally(detach);
+        setTimeout(() => document.addEventListener('mousedown', onOutside, true), 80);
     }
 
     // ── 在魔法棒菜单里挂「空回助手」入口 ────────────────────────────────────
