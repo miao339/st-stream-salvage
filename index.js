@@ -245,16 +245,24 @@
     }
 
     // ── 缓存最近一次响应，供手动抢救 ────────────────────────────────────────
-    function rememberStream(url, toolHint, chunks, total, complete) {
+    function rememberStream(url, toolHint, chunks, total, ignored) {
         try {
             const data = new Uint8Array(total);
             let offset = 0;
             for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.length; }
+
+            // 「完整」的判据是原始字节里有没有 [DONE]，而不是「有没有抢救过」。
+            // 只看尾巴 4KB，别为了判个真假把 8MB 全解一遍。
+            let tailText = '';
+            try {
+                tailText = new TextDecoder('utf-8').decode(data.slice(Math.max(0, total - 4096)));
+            } catch (_) {}
+
             state.lastStream = {
                 at: Date.now(),
                 url: String(url || ''),
                 bytes: total,
-                complete,
+                complete: tailText.includes('[DONE]'),
                 tool: toolHint || null,
                 data,
             };
@@ -391,7 +399,12 @@
     async function rescueIntoChat() {
         const record = state.lastStream;
         if (!record || !record.bytes) {
-            notify('还没有抓到可抢救的响应，先触发一次空回再说');
+            notify('还没有抓到可抢救的响应。先在酒馆发一次消息，空回之后再点这里');
+            return;
+        }
+
+        if (record.complete) {
+            notify('上一次响应是正常完成的，没有断流，不需要抢救（硬点会重复插入一份正文）');
             return;
         }
 
@@ -446,21 +459,11 @@
         const cached = state.lastStream;
 
         const html = `
-        <div style="text-align:left;line-height:1.75;">
-            <h3 style="margin:0 0 10px;">空回助手</h3>
-            <p style="margin:0 0 8px;">
-                解决「站点写完了、酒馆却是空白」的空回。
-            </p>
-            <p style="margin:0 0 8px;opacity:.85;">
-                站点是假流式：先在服务器上把整段写完，最后一次性推回来。
-                这一下如果没推完整，酒馆就解析不出内容，整段丢掉，于是空白。
-            </p>
-            <p style="margin:0 0 8px;opacity:.85;">
-                插件会在最后那一截没收尾时，把已经写完整的部分捡出来，
-                重新包成酒馆认得的格式，所以正文照常出现。
-            </p>
-            <p style="margin:0 0 12px;opacity:.85;">
-                只接管「聊天补全」这一个请求，其它请求一概不碰；正常输出也不会被改动。
+        <div style="text-align:left;line-height:1.7;">
+            <h3 style="margin:0 0 8px;">空回助手</h3>
+            <p style="margin:0 0 10px;opacity:.85;">
+                站点是假流式，最后一次性把整段推回来。推不完整，酒馆解析不出内容就整段丢掉，于是空白。
+                插件在这一截没收尾时，把已经写好的部分救出来，重新交给酒馆。只接管聊天补全请求，其它不碰。
             </p>
             <label style="display:flex;align-items:center;gap:8px;padding:10px 0;border-top:1px solid var(--SmartThemeBorderColor);">
                 <input type="checkbox" id="ss-assistant-enable" ${state.enabled ? 'checked' : ''}>
@@ -473,6 +476,11 @@
             </div>
             <div class="menu_button" id="ss-assistant-rescue" style="margin-top:12px;width:fit-content;">
                 从缓存立即抢救一次
+            </div>
+            <div style="font-size:.86em;opacity:.65;margin-top:8px;line-height:1.6;">
+                什么时候点：空回之后（转圈结束、聊天框空着），趁还没发下一条消息时点。
+                它会从上面那份缓存里把正文提取出来，直接写进当前聊天。
+                再发一次消息，缓存就会被新的一份覆盖，到时候就救不回来了。
             </div>
         </div>`;
 
