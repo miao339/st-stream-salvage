@@ -293,7 +293,10 @@
             if (!pending.trim()) return false;
             const rescued = salvageTail(pending, toolHint);
             if (!rescued) {
-                warn(`${reason}：尾巴里没有可抢救的已闭合字段`);
+                // 救不了就把原始尾巴原样吐出去，绝不吞数据。
+                // 等于退化回「没装这个插件」的状态，下游爱怎么处理怎么处理。
+                warn(`${reason}：尾巴里没有可抢救的已闭合字段，原样放行`);
+                try { controller.enqueue(encoder.encode(pending)); } catch (_) {}
                 return false;
             }
             try { controller.enqueue(encoder.encode(rescued.text)); } catch (_) { return false; }
