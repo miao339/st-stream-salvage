@@ -704,8 +704,8 @@
                     <div class="fa-solid fa-kit-medical extensionsMenuExtensionButton"></div>
                     <span>空回助手</span>
                 </div>`;
-            container.addEventListener('click', event => {
-                event.stopPropagation();
+            // 不要 stopPropagation：ST 靠 click 冒泡到 <html> 来收起魔法棒菜单
+            container.addEventListener('click', () => {
                 openAssistant();
             });
             menu.appendChild(container);
