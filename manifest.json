@@ -1,0 +1,11 @@
+{
+  "display_name": "流式抢救 · Stream Salvage",
+  "loading_order": 200,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "",
+  "author": "miao339",
+  "version": "1.0.0",
+  "homePage": "https://github.com/miao339/st-stream-salvage"
+}
