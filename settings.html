@@ -1,0 +1,43 @@
+<div id="stream-salvage-panel">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>流式抢救 · Stream Salvage</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <div style="display:flex;flex-direction:column;gap:4px;">
+                <label style="display:flex;justify-content:space-between;">
+                    <span>状态</span>
+                    <span id="ss-enabled" style="color:var(--SmartThemeEmColor);">运行中</span>
+                </label>
+                <label style="display:flex;justify-content:space-between;">
+                    <span>最外层接管</span>
+                    <span id="ss-outer" style="color:var(--SmartThemeEmColor);">—</span>
+                </label>
+                <label style="display:flex;justify-content:space-between;">
+                    <span>已抢救次数</span>
+                    <span id="ss-rescued" style="color:var(--SmartThemeEmColor);">0</span>
+                </label>
+                <label style="display:flex;justify-content:space-between;">
+                    <span>最近一次</span>
+                    <span id="ss-last" style="color:var(--SmartThemeEmColor);max-width:60%;text-align:right;">—</span>
+                </label>
+                <label style="display:flex;justify-content:space-between;">
+                    <span>接管层数</span>
+                    <span id="ss-hooks" style="color:var(--SmartThemeEmColor);">0</span>
+                </label>
+                <label style="display:flex;justify-content:space-between;">
+                    <span>已缓存</span>
+                    <span id="ss-cached" style="color:var(--SmartThemeEmColor);max-width:60%;text-align:right;">—</span>
+                </label>
+            </div>
+            <div class="menu_button menu_button_icon" id="ss-reinstall" style="margin-top:8px;width:fit-content;">
+                <i class="fa-solid fa-rotate"></i>
+                <span>重新接管</span>
+            </div>
+            <small style="display:block;margin-top:6px;opacity:.75;">
+                上游断在行内时，自动把已经写完整的部分救回来并提示。正常输出不会被动到。
+            </small>
+        </div>
+    </div>
+</div>
