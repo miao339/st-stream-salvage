@@ -25,6 +25,15 @@
     // 原样调用 inner.fetch，不解析也不拷贝，避免和任何其他插件抢活。
     const CHAT_ENDPOINT = /\/(?:api\/backends\/chat-completions\/generate|api\/backends\/text-completions\/generate|v1\/chat\/completions|chat\/completions|generateContent)(?:[?#]|$)/i;
 
+    const PREF_KEY = 'streamSalvage.enabled';
+
+    function loadEnabled() {
+        try {
+            const raw = localStorage.getItem(PREF_KEY);
+            return raw === null ? true : raw === '1';
+        } catch (_) { return true; }
+    }
+
     const state = {
         installedAt: Date.now(),
         rescued: 0,
@@ -32,7 +41,14 @@
         wrapDepth: 0,
         lastStream: null,      // { at, url, bytes, complete, data: Uint8Array, tool }
         menuInstalled: false,
+        enabled: loadEnabled(),
     };
+
+    function setEnabled(value) {
+        state.enabled = Boolean(value);
+        try { localStorage.setItem(PREF_KEY, state.enabled ? '1' : '0'); } catch (_) {}
+        notify(state.enabled ? '空回自动抢救：已开启' : '空回自动抢救：已关闭');
+    }
 
     function log(...args) {
         try { console.log(`[${SCRIPT_NAME}]`, ...args); } catch (_) {}
@@ -345,6 +361,8 @@
         const inner = current;
         const wrapped = async function (...args) {
             const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+            // 开关关闭时完全不介入
+            if (!state.enabled) return inner.apply(this, args);
             // 只处理聊天补全，其余请求原样放行
             if (!CHAT_ENDPOINT.test(url)) return inner.apply(this, args);
             const toolHint = extractToolName(args);
@@ -418,7 +436,65 @@
         }
     }
 
-    // ── 在魔法棒菜单里挂一个「空回抢救」按钮 ────────────────────────────────
+    // ── 空回助手：说明 + 开关 + 状态 ────────────────────────────────────────
+    async function openAssistant() {
+        const ctx = stContext();
+        const last = state.lastRescue;
+        const cached = state.lastStream;
+
+        const html = `
+        <div style="text-align:left;line-height:1.75;">
+            <h3 style="margin:0 0 10px;">空回助手</h3>
+            <p style="margin:0 0 8px;">
+                解决「站点写完了、酒馆却是空白」的空回。
+            </p>
+            <p style="margin:0 0 8px;opacity:.85;">
+                站点是假流式：先在服务器上把整段写完，最后一次性推回来。
+                这一下如果没推完整，酒馆就解析不出内容，整段丢掉，于是空白。
+            </p>
+            <p style="margin:0 0 8px;opacity:.85;">
+                插件会在最后那一截没收尾时，把已经写完整的部分捡出来，
+                重新包成酒馆认得的格式，所以正文照常出现。
+            </p>
+            <p style="margin:0 0 12px;opacity:.85;">
+                只接管「聊天补全」这一个请求，其它请求一概不碰；正常输出也不会被改动。
+            </p>
+            <label style="display:flex;align-items:center;gap:8px;padding:10px 0;border-top:1px solid var(--SmartThemeBorderColor);">
+                <input type="checkbox" id="ss-assistant-enable" ${state.enabled ? 'checked' : ''}>
+                <span>启用自动抢救</span>
+            </label>
+            <div style="font-size:.92em;opacity:.8;line-height:1.6;">
+                已抢救：<b>${state.rescued}</b> 次<br>
+                最近一次：${last ? `${last.chars} 字 · ${last.mode}` : '—'}<br>
+                已缓存：${cached ? `${cached.bytes} 字节 · ${cached.complete ? '完整' : '断流'}` : '—'}
+            </div>
+            <div class="menu_button" id="ss-assistant-rescue" style="margin-top:12px;width:fit-content;">
+                从缓存立即抢救一次
+            </div>
+        </div>`;
+
+        if (!ctx || typeof ctx.callGenericPopup !== 'function') {
+            setEnabled(!state.enabled);
+            notify('当前酒馆不支持弹窗，已直接切换开关');
+            return;
+        }
+
+        try {
+            ctx.callGenericPopup(html, ctx.POPUP_TYPE.TEXT, '', { wide: true, okButton: '关闭', cancelButton: false });
+        } catch (error) {
+            notify('打开面板失败：' + error.message);
+            return;
+        }
+
+        setTimeout(() => {
+            const cb = document.getElementById('ss-assistant-enable');
+            if (cb) cb.addEventListener('change', event => setEnabled(event.target.checked));
+            const btn = document.getElementById('ss-assistant-rescue');
+            if (btn) btn.addEventListener('click', () => rescueIntoChat());
+        }, 150);
+    }
+
+    // ── 在魔法棒菜单里挂「空回助手」入口 ────────────────────────────────────
     function installMenuButton() {
         try {
             if (state.menuInstalled && document.getElementById('ss-rescue-menu-item')) return;
@@ -429,15 +505,15 @@
             const container = document.createElement('div');
             container.id = 'ss-rescue-menu-item';
             container.className = 'extension_container interactable';
-            container.title = '把上一次空回的正文救进当前聊天';
+            container.title = '空回助手：查看说明与开关';
             container.innerHTML = `
                 <div class="list-group-item flex-container flexGap5">
                     <div class="fa-solid fa-kit-medical extensionsMenuExtensionButton"></div>
-                    <span>空回抢救</span>
+                    <span>空回助手</span>
                 </div>`;
             container.addEventListener('click', event => {
                 event.stopPropagation();
-                rescueIntoChat();
+                openAssistant();
             });
             menu.appendChild(container);
             state.menuInstalled = true;
@@ -491,6 +567,7 @@
                 const cached = state.lastStream;
                 return {
                     installedAt: state.installedAt,
+                    enabled: state.enabled,
                     rescued: state.rescued,
                     lastRescue: state.lastRescue,
                     outermost: Boolean(window.fetch && window.fetch[WRAP_MARK]),
